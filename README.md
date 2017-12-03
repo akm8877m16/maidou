@@ -7,3 +7,4 @@ api backend for maidou Project
 数据处理任务   celery
 restful and websocket  tornado 
 数据存储： mongodb , redis, mysql
+orm: 使用django orm模块
