@@ -14,9 +14,9 @@ import paho.mqtt.client as mqtt
 from tornado.options import options, define
 import pika
 
-sys.path.append('/home/webapps/maidouProject')
+sys.path.append('/home/webapps/maidouProjectDjango')
 
-from celeryTasks.tasks import showMessage
+from celeryTasks.tasks import showMessage, sendMessage
 
 define("mqttPort", default=1883, help="mqtt port")
 define("mqttServer",default="118.190.202.155")
@@ -96,6 +96,7 @@ def on_message(client, userdata, msg):
     connection.close()
     '''
     showMessage.delay(message)
+    #sendMessage.delay(message)
 
 
 # 主程序

@@ -11,13 +11,15 @@ import redis
 # Create your models here.
 
 class UserControl(models.Model):
-    user_name = models.CharField(max_length=50, unique=True, null=True)  # 用户名 默认phone number
+    user_name = models.CharField(max_length=50, null=True)  # 用户名 默认phone number
     password = models.CharField(max_length=50)  # 密码
     phone = models.CharField(max_length=20, unique=True, null=True, blank=True)  # 手机
+    email = models.CharField(max_length=100, unique=True, null=True,blank=True) #油箱
     token = models.CharField(unique=True, max_length=32)  # 授权令牌
     token_refresh_at = models.DateTimeField(auto_now_add=True)  # 授权令牌上一次更新时间
     last_login = models.DateTimeField(auto_now=True)  # 上次登入时间
     date_joined = models.DateTimeField(auto_now_add=True)  # 创建时间
+    headerImage = models.CharField(max_length=200, null=True) #头像url
     r = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
     def __str__(self):
@@ -75,7 +77,7 @@ class Device(models.Model):
     sn = models.CharField(max_length=30, unique=True)  #户号
     name = models.CharField(max_length=50, default='') #户名
     address = models.CharField(max_length=200, default='') #地址
-    controlPass = models.CharField(max_length=10, default='') #控制密码
+    controlPass = models.CharField(max_length=10, default='123456') #控制密码
 
 #控权限表，
 class deviceControl(models.Model):

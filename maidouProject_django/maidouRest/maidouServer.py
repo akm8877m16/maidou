@@ -2,6 +2,8 @@
 import sys
 import tornado.escape
 import tornado.httpserver
+from tornado.web import URLSpec
+from tornado.web import StaticFileHandler
 import tornado.ioloop
 import tornado.options
 from tornado import gen, web
@@ -18,14 +20,19 @@ import os
 import hashlib
 import random
 import uuid
+import pprint
+import functools
 from tornado.concurrent import run_on_executor
 from concurrent.futures import ThreadPoolExecutor
 from django.db import IntegrityError
 import calendar
 import redis
 sys.path.append('/home/webapps/maidouProjectDjango')
+from config import UPLOAD_IMAGE_PATH
 from utils.ajax import JsonResponse,JsonError
+from utils.helperFuncs import isEmail, isMobilePhone
 from sms.aliyunsdkdysmsapi.demo import send_sms
+from celeryTasks.tasks import sendMessage, sendMail
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'account.settings')
 import django
 if django.VERSION >= (1, 7):
@@ -59,10 +66,13 @@ class Application(tornado.web.Application):
             (r"/maidou/updateDevice", updateDeviceHandler),
             (r"/maidou/checkOwner", checkOwnerHandler),
             (r"/maidou/billMonth/(\w+)", billMonthHandler),#获取当前月的电量统计
-            (r"/maidou/billMonthHistory/(\w+)", billMonthHistoryHandler)
+            (r"/maidou/billMonthHistory/(\w+)", billMonthHistoryHandler),
+            (r"/maidou/headImage", headImageHandler),
+            (r"/maidou/sendEmail", mailHandler),
+            (r"/maidou/changeName", changeNameHandler),
         ]
         settings = dict(
-
+            static_path="static",
         )
         super(Application, self).__init__(handlers, **settings)
         # Have one global connection to the blog DB across all handlers
@@ -91,6 +101,7 @@ class openStatusHandler(BaseHandler):
     @asynchronous
     @gen.coroutine
     def get(self,sn):
+        sn = sn.upper()
         result = yield self.db.data_event.find_one({'sn': sn,'open': { '$exists': True }}, sort=[('postTime', -1)])
         response = {}
         if not result:
@@ -110,6 +121,7 @@ class eventHandler(BaseHandler):
     @asynchronous
     @gen.coroutine
     def get(self, sn):
+        sn = sn.upper()
         response = {}
         eventArray = [];
         cursor = self.db.data_event.find({'sn': sn,'event_number': { '$gt': 0 },'event_number': { '$lt': 170 } }, sort=[('postTime', -1)]).limit(100)
@@ -130,6 +142,7 @@ class realDataHandler(BaseHandler):
     @asynchronous
     @gen.coroutine
     def get(self,sn):
+        sn = sn.upper()
         result_a = yield self.db.data_real.find_one({"sn": sn, "type": "analog"}, sort=[("postTime", -1)])
         result_p= yield self.db.data_real.find_one({'sn': sn, 'type': 'power'}, sort=[('postTime', -1)])
         #pprint.pprint(result_a)
@@ -140,6 +153,7 @@ class realDataHandler(BaseHandler):
             response["UA"] = result_a["UA"]
             response["IA"] = result_a["IA"]
             response["P"] = result_a["P"]
+            response["Q"] =4
         else:
             response["FR"] = 0
             response["UA"] = 0
@@ -175,6 +189,7 @@ class webSocketHandler(tornado.websocket.WebSocketHandler):
             results = message.split(",")
             command = results[0]
             sn = results[1]
+            sn = sn.upper()
             response={}
             if(command == "ifOnline"): #check if device online
                 result =  yield self.application.db.data_real.find_one({"sn": sn}, sort=[("postTime", -1)])
@@ -197,6 +212,7 @@ class webSocketHandler(tornado.websocket.WebSocketHandler):
                     response["UA"] = result_a["UA"]
                     response["IA"] = result_a["IA"]
                     response["P"] = result_a["P"]
+                    response["Q"] = 4
                 if result_p != None:
                     response["WpP"] = result_p["WpP"]
             elif(command == "ifOpen"):
@@ -236,6 +252,7 @@ class historyHourHandler(BaseHandler):
     @asynchronous
     @gen.coroutine
     def get(self, sn, type):
+        sn = sn.upper()
         response = {}
         cursor = self.db.data_hour.find({"sn": sn, "type": type}, sort=[("postTime", -1)]).limit(100)
         historyArray = [];
@@ -258,6 +275,7 @@ class firstMonthValueHandler(BaseHandler):
     @asynchronous
     @gen.coroutine
     def get(self, sn, month):
+        sn = sn.upper()
         monthV = int(month)
         queryTime = datetime.datetime.now()
         response = {}
@@ -283,32 +301,44 @@ class firstMonthValueHandler(BaseHandler):
     instead of sending command through mqtt directly,now command was sent 
     by server itself
     command: open, close
+    2017/12/15 add remote control type default wifi control  0      tcp controller 1   
 '''
 class remoteControlHandler(BaseHandler):
-    @asynchronous
     def get(self, sn, command):
-        mqttClient = mqtt.Client()
-        mqttClient.connect("118.190.202.155", 1883)
-        if command == "open":
-            openCommand = [0x00,0x00,0x00,0x00,0x00,0x06,0x01,0x05,0x00,0x00,0xAA,0xAA]
-            ack = bytearray()
-            ack.extend(openCommand)
-            mqttClient.publish("M/"+sn, ack)
-        elif command == "close":
-            closeCommand = [0x00,0x00,0x00,0x00,0x00,0x06,0x01,0x05,0x00,0x00,0x55,0x55]
-            ack = bytearray()
-            ack.extend(closeCommand)
-            mqttClient.publish("M/" + sn, ack)
-        elif command == "selfCheck":
-            closeCommand = [0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x11]
-            ack = bytearray()
-            ack.extend(closeCommand)
-            mqttClient.publish("M/" + sn, ack)
-        mqttClient.disconnect()
-        response = {}
-        response["message"] = "success"
-        self.write(response)
-        self.finish()
+        sn = sn.upper()
+        controlType = self.get_argument('type', 0)
+        if controlType == '1':
+            sendMessage.delay(sn, command)
+            response = {}
+            response["message"] = "success"
+            self.write(response)
+        else:
+            mqttClient = mqtt.Client()
+            mqttClient.connect("118.190.202.155", 1883)
+            if command == "open":
+                openCommand = [0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x05, 0x00, 0x00, 0xAA, 0xAA]
+                ack = bytearray()
+                ack.extend(openCommand)
+                mqttClient.publish("M/" + sn, ack)
+            elif command == "close":
+                closeCommand = [0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x05, 0x00, 0x00, 0x55, 0x55]
+                ack = bytearray()
+                ack.extend(closeCommand)
+                mqttClient.publish("M/" + sn, ack)
+            elif command == "selfCheck":
+                closeCommand = [0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x11]
+                ack = bytearray()
+                ack.extend(closeCommand)
+                mqttClient.publish("M/" + sn, ack)
+            mqttClient.disconnect()
+            response = {}
+            response["message"] = "success"
+            self.write(response)
+
+    def sendTcp(self, message):
+        print message
+        sendMessage.delay(message)
+        print 'testtest'
 '''
 user login 
 password
@@ -325,21 +355,30 @@ class loginHandler(BaseHandler):
             password = self.get_argument('password', None)
             username = self.get_argument('username', None)  #phone number for now
             if username is None:
-                self.write(JsonError('请填写电话'))
+                self.write(JsonError('login_user_name_error'))
             if password is None:
-                self.write(JsonError('请填写密码'))
-
-            uc = UserControl.objects.get(phone=username, password=hashlib.md5('hpy:' + password).hexdigest())
-
+                self.write(JsonError('password_empty'))
+            if isMobilePhone(username):
+                uc = UserControl.objects.get(phone=username, password=hashlib.md5('hpy:' + password).hexdigest())
+            elif isEmail(username):
+                uc = UserControl.objects.get(email=username, password=hashlib.md5('hpy:' + password).hexdigest())
+            else:
+                self.write(JsonError('user_name_error'))
+                return
+            if not uc.user_name:
+                userName = ''
+            else:
+                userName = uc.user_name
             self.write(JsonResponse({
-                'msg': '登录成功',
-                'token': uc.token
+                'msg': 'success',
+                'token': uc.token,
+                'username': userName
             }))
         except UserControl.DoesNotExist:
-            self.write(JsonError('用户名密码错误'))
+            self.write(JsonError('no_user'))
         except Exception as e:
             print e
-            self.write(JsonError('登录失败'))
+            self.write(JsonError('login_failed'))
 '''
 register
 username
@@ -354,40 +393,59 @@ class registerHandler(BaseHandler):
         username = self.get_argument('username', None) # phone number for now
         print username
         code = self.get_argument('code', None)
-        if username is None:
-            self.write(JsonError(u'注册账号请填写手机'))
-        if password is None:
-            self.write(JsonError(u'密码不允许为空'))
         r = redis.Redis(connection_pool=self.redisPool)
         smsCode = r.get(username)
         if smsCode is None:
-            self.write(JsonError(u'验证码已过期'))
+            self.write(JsonError('code_expire'))
         elif int(code) == int(smsCode):
             #register when verification code in valid
-            if UserControl.objects.filter(phone=username).exists():
-                self.write(JsonError(u'注册失败,手机号已经存在.'))
-            else:
-                user = UserControl(phone=username)
-                user.set_password(password)
-                # 首次写入token令牌
-                user.refreshToken()
-                try:
-                    user.save()
-                    print "first save"
-                    result = {
-                        'msg': '注册成功',
-                        'user_id': user.pk,
-                        'token': user.token,
-                        'token_refresh_at': user.token_refresh_at.strftime('%Y-%m-%d %H:%M:%S')
-                    }
-                    self.write(JsonResponse(result))
-                except IntegrityError:
-                    self.write(JsonError(u'注册失败,请重试.'))
-                except Exception as e:
-                    print e
-                    self.write(JsonError(u'注册失败,请重试. '))
+            if isMobilePhone(username):
+                if UserControl.objects.filter(phone=username).exists():
+                    self.write(JsonError('user_exist'))
+                else:
+                    user = UserControl(phone=username,user_name=username)
+                    user.set_password(password)
+                    # 首次写入token令牌
+                    user.refreshToken()
+                    try:
+                        user.save()
+                        result = {
+                            'msg': 'register_success',
+                            'user_id': user.pk,
+                            'token': user.token,
+                            'token_refresh_at': user.token_refresh_at.strftime('%Y-%m-%d %H:%M:%S')
+                        }
+                        self.write(JsonResponse(result))
+                    except IntegrityError:
+                        self.write(JsonError('register_fail'))
+                    except Exception as e:
+                        print e
+                        self.write(JsonError('register_fail'))
+
+            elif isEmail(username):
+                if UserControl.objects.filter(email=username).exists():
+                    self.write(JsonError('user_exist'))
+                else:
+                    user = UserControl(email=username, user_name=username)
+                    user.set_password(password)
+                    # 首次写入token令牌
+                    user.refreshToken()
+                    try:
+                        user.save()
+                        result = {
+                            'msg': 'register_success',
+                            'user_id': user.pk,
+                            'token': user.token,
+                            'token_refresh_at': user.token_refresh_at.strftime('%Y-%m-%d %H:%M:%S')
+                        }
+                        self.write(JsonResponse(result))
+                    except IntegrityError:
+                        self.write(JsonError('register_fail'))
+                    except Exception as e:
+                        print e
+                        self.write(JsonError('register_fail'))
         else:
-            self.write(JsonError(u'验证码不匹配'))
+            self.write(JsonError('code_wrong'))
 
 
 '''
@@ -433,31 +491,36 @@ class resetPassHandler(BaseHandler):
         """
         self.make_sure_mysql_usable()
         newPass = self.get_argument('newPass', None)
-        phone = self.get_argument('phone', None)
+        phone = self.get_argument('phone', None) #接口更新，这个phone可以是手机号码或者邮箱
         code = self.get_argument('code', None)
         r = redis.Redis(connection_pool=self.redisPool)
         smsCode = r.get(phone)
         print smsCode
-        if phone and code and newPass:
+        if not smsCode:
+            self.write(JsonError('code_wrong'))
+        elif phone and code and newPass:
                 if int(code) == int(smsCode):
-                    try:
-                        user = UserControl.objects.get(phone=phone)
-                        user.set_password(newPass)
-                        user.refreshToken()  # 刷新token
-                        user.save()
-                        self.write(JsonResponse(user.token))
-                    except UserControl.DoesNotExist:
-                        self.write(JsonError(u'用户不存在,请重新登入'))
-                    except IntegrityError as e:
-                        print e
-                        self.write(JsonError(u'密码更改失败'))
-                    except Exception as e:
-                        print e
-                        self.write(JsonError(u'密码更改失败 '))
+                        try:
+                            if isMobilePhone(phone):
+                                user = UserControl.objects.get(phone=phone)
+                            elif isEmail(phone):
+                                user = UserControl.objects.get(email=phone)
+                            user.set_password(newPass)
+                            user.refreshToken()  # 刷新token
+                            user.save()
+                            self.write(JsonResponse(user.token))
+                        except UserControl.DoesNotExist:
+                            self.write(JsonError('no_user'))
+                        except IntegrityError as e:
+                            print e
+                            self.write(JsonError('password_change_fail'))
+                        except Exception as e:
+                            print e
+                            self.write(JsonError('password_change_fail'))
                 else:
-                    self.write(JsonError(u'短信验证失败'))
+                    self.write(JsonError('code_wrong'))
         else:
-            self.write(JsonError(u'参数错误'))
+            self.write(JsonError('wrong_parameters'))
 
 class quitHandler(BaseHandler):
     @run_on_executor
@@ -467,9 +530,9 @@ class quitHandler(BaseHandler):
             uc = UserControl.objects.get(token=token)
             uc.refreshToken()
             uc.save()
-            self.write(JsonResponse(u'退出登录'))
+            self.write(JsonResponse('quit'))
         except Exception as e:
-            self.write(JsonError('token 无效'))
+            self.write(JsonError('token_invalid'))
 
 class deviceHandler(BaseHandler):
     @run_on_executor
@@ -504,6 +567,8 @@ class addDeviceHandler(BaseHandler):
      def post(self):
         self.make_sure_mysql_usable()
         sn = self.get_argument('sn', None)
+        if sn is not None:
+            sn = sn.upper()
         token = self.get_argument('token',None)
         try:
             uc = UserControl.objects.get(token=token)
@@ -513,16 +578,16 @@ class addDeviceHandler(BaseHandler):
             if not dc:
                 dc = deviceControl(device = device,user=uc,right=2)
                 dc.save()
-            return self.write(JsonResponse('添加成功.'))
+            return self.write(JsonResponse('device_add_success'))
         except Device.DoesNotExist:
             device = Device.objects.create(type='1', sn=sn)
             uc.device_set.add(device)
             dc = deviceControl(device=device, user=uc, right=1)
             dc.save()
-            self.write(JsonResponse('添加成功.'))
+            self.write(JsonResponse('device_add_success'))
         except Exception as e:
             print e
-            self.write(JsonError('设备添加失败. '+ e.__str__()))
+            self.write(JsonError('device_add_fail'))
 
 '''
 sn
@@ -533,6 +598,8 @@ class delDeviceHandler(BaseHandler):
     def post(self):
         self.make_sure_mysql_usable()
         sn = self.get_argument('sn', None)
+        if sn is not None:
+            sn = sn.upper()
         token = self.get_argument('token', None)
         try:
             uc = UserControl.objects.get(token=token)
@@ -541,12 +608,12 @@ class delDeviceHandler(BaseHandler):
             users = UserControl.objects.filter(device__sn = sn)
             if not users:
                 device.delete()
-            return self.write(JsonResponse('删除成功.'))
+            return self.write(JsonResponse('unbind_device_success'))
         except Device.DoesNotExist:
-            self.write(JsonError('删除成功.设备已删除'))
+            self.write(JsonError('unbind_device_success'))
         except Exception as e:
             print e
-            self.write(JsonError('设备删除失败'))
+            self.write(JsonError('unbind_device_fail'))
 '''
 name
 address
@@ -561,6 +628,8 @@ class updateDeviceHandler(BaseHandler):
         address = self.get_argument('address', '')
         controlPass = self.get_argument('controlPass', '')
         sn = self.get_argument('sn', None)
+        if sn is not None:
+            sn = sn.upper()
         token = self.get_argument('token', None)
         try:
             uc = UserControl.objects.get(token=token)
@@ -573,10 +642,10 @@ class updateDeviceHandler(BaseHandler):
             device.address = address
             device.controlPass = controlPass
             device.save()
-            self.write(JsonResponse('设备信息更新成功'))
+            self.write(JsonResponse('update_device_info_success'))
         except Exception as e:
             print e
-            self.write(JsonError('设备信息更新失败'))
+            self.write(JsonError('update_device_info_fail'))
 '''
 sn
 token
@@ -586,6 +655,8 @@ class checkOwnerHandler(BaseHandler):
     def post(self):
         self.make_sure_mysql_usable()
         sn = self.get_argument('sn', '')
+        if sn != '':
+            sn = sn.upper()
         token = self.get_argument('token', '')
         try:
             uc = UserControl.objects.get(token=token)
@@ -604,6 +675,7 @@ class billMonthHandler(BaseHandler):
     @asynchronous
     @gen.coroutine
     def get(self,sn):
+        sn = sn.upper()
         queryTime = datetime.datetime.utcnow()
         currentMonth = queryTime.month
         print queryTime
@@ -632,6 +704,7 @@ class billMonthHistoryHandler(BaseHandler):
     @asynchronous
     @gen.coroutine
     def get(self, sn):
+        sn = sn.upper()
         queryTime = datetime.datetime.utcnow()
         billHistory = []
         starttime = datetime.datetime(queryTime.year, 1, 1, 0, 0, 0)
@@ -647,6 +720,76 @@ class billMonthHistoryHandler(BaseHandler):
             billHistory.append(billMonth)
         self.write(JsonResponse(billHistory))
         self.finish()
+
+'''
+头像接口
+'''
+class headImageHandler(BaseHandler):
+
+    @run_on_executor()
+    def get(self):
+        self.make_sure_mysql_usable()
+        token = self.get_argument('token', None)
+        try:
+            uc = UserControl.objects.get(token=token)
+            if not uc.headerImage:
+                self.write(JsonResponse('nothing'))
+            else:
+                self.write(JsonResponse(uc.headerImage))
+        except UserControl.DoesNotExist:
+            self.write(JsonError('need login in'))
+
+
+
+    @run_on_executor
+    def post(self):
+        filesList = self.request.files.items()
+        uploadFile = filesList[0]
+        info = uploadFile[1][0]
+        filename, content_type = info['filename'], info['content_type']
+        body = info['body']
+        print('POST "%s" "%s" %d bytes',filename, content_type, len(body))
+        self.make_sure_mysql_usable()
+        token = self.get_argument('token', None)
+        try:
+            uc = UserControl.objects.get(token=token)
+            uc.headerImage = filename
+            uc.save()
+            with open(os.path.join(UPLOAD_IMAGE_PATH, filename), 'wb') as up:  # os拼接文件保存路径，以字节码模式打开
+                up.write(body)  # 将文件写入到保存路径目录
+            self.write(JsonResponse(filename))
+        except UserControl.DoesNotExist:
+            self.write(JsonError('need login in'))
+        except Exception as e:
+            self.write(JsonError(e.__str__()))
+
+class mailHandler(BaseHandler):
+    def post(self):
+        userEmail = self.get_argument('email', None)
+        if userEmail is not None:
+            code = random.randint(100000, 999999)
+            sendMail.delay(userEmail,str(code));
+            r = redis.Redis(connection_pool=self.redisPool)
+            r.set(userEmail, code, ex=600)  # expire 6 min
+            self.write(JsonResponse("success"))
+        else:
+            self.write(JsonError("no email input"))
+
+class changeNameHandler(BaseHandler):
+    @run_on_executor
+    def post(self):
+        token = self.get_argument('token', None)
+        newName = self.get_argument('newName', None)
+        try:
+            user = UserControl.objects.get(token=token)
+            user.user_name = newName
+            user.save()
+            self.write(JsonResponse({'name':newName}))
+        except Exception as e:
+            print e
+            self.write(JsonError('chane new name failed'))
+
+
 
 
 def main():

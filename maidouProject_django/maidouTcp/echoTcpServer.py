@@ -4,14 +4,14 @@ from tornado.ioloop import IOLoop
 from tornado import gen
 from tornado.iostream import StreamClosedError
 from tornado.tcpserver import TCPServer
+import tornado.options
 from tornado.options import options, define
-from maidouTcp.connection import connection
 import signal
+import sys
+sys.path.append('/home/webapps/maidouProjectDjango')
+from maidouTcp.connection import connection
 
 define("port", default=9888, help="TCP port to listen on")
-logger = logging.getLogger(__name__)
-
-def hexString(x): return format(x, '02x')
 
 class Server(TCPServer):
     """
@@ -21,19 +21,15 @@ class Server(TCPServer):
     """
     def __init__(self, *args, **kwargs):
         super(Server, self).__init__(*args, **kwargs)
-        self._connections = []
-
 
     @gen.coroutine
     def handle_stream(self, stream, address):
         print('New request has come from our {} buddy...'.format(address))
-        deviceConnection = connection(stream,address)
-        self._connections.append(connection)
-        yield connection.run()
-        self._connections.remove(connection)
+        connection(stream,address)
 
     @gen.coroutine
     def shutdown(self):
+        print 'server shutdown'
         super(Server, self).stop()
         self.io_loop.stop()
 
@@ -47,11 +43,8 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, sig_handler)
     signal.signal(signal.SIGINT, sig_handler)
-
+    tornado.options.parse_command_line()
     server = Server()
-    server.listen(5567)
-    IOLoop.current().spawn_callback(server.subscribe, 'updates')
-
+    server.listen(options.port)
     print('Starting the server...')
-    asyncio.get_event_loop().run_forever()
-    print('Server has shut down.')
+    IOLoop.current().start()

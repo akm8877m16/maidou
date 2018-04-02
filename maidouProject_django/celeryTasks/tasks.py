@@ -11,7 +11,17 @@ import time
 from util.messageConst import CONST_DIC_ANALOG,CONST_DIC_POWER,CONST_DIC_ANALOG_RATIO,CONST_DIC_POWER_RATIO
 
 from maidouTcp.logger import baseLogger
-import pika
+import socket
+import sys
+import smtplib
+import email
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+from email.mime.base import MIMEBase
+from email.mime.application import MIMEApplication
+from email.header import Header
+
 
 #events = db.events  # 事件集合
 #electricPower = db["electricPower"]  # 电度集合
@@ -285,4 +295,108 @@ def getBillMonth():
         billMonth["sn"] = sn
         intset_result2 = dataHistoryMonth.insert_one(billMonth)
         baseLogger.debug(intset_result2.inserted_id)
+
+'''
+tcp remote control
+'''
+@app.task()
+def sendMessage(sn, command):
+    message = [0xaa, 0xaa]
+    snToBytes = []
+    for i in range(0,len(sn)):
+        snToBytes.append(ord(sn[i]))
+
+    print snToBytes
+    message.extend(snToBytes)
+    if command == "open":
+        message.extend([0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x05, 0x00, 0x00, 0xAA, 0xAA])
+    elif command == "close":
+        message.extend([0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x05, 0x00, 0x00, 0x55, 0x55])
+    elif command == "selfCheck":
+        message.extend([0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x11])
+    print message
+    dataString = "".join(map(chr, message))
+    HOST = '118.190.202.155'  # The remote host
+    PORT = 9888  # The same port as used by the server
+    s = None
+    for res in socket.getaddrinfo(HOST, PORT, socket.AF_UNSPEC, socket.SOCK_STREAM):
+        af, socktype, proto, canonname, sa = res
+        try:
+            s = socket.socket(af, socktype, proto)
+        except socket.error as msg:
+            print msg
+            s = None
+            continue
+        try:
+            s.connect(sa)
+        except socket.error as msg:
+            s.close()
+            s = None
+            continue
+        break
+    if s is None:
+        print 'could not open socket'
+        sys.exit(1)
+    s.sendall(dataString)
+    s.close()
+
+@app.task()
+def sendMail(destinationMail, code):
+
+    # 发件人地址，通过控制台创建的发件人地址
+    username = 'service@verify.matismart.com'
+    # 发件人密码，通过控制台创建的发件人密码
+    password = 'MAtis68531026'
+    # 自定义的回复地址
+    replyto = ''
+    # 收件人地址或是地址列表，支持多个收件人，最多30个
+    # rcptto = ['***', '***']
+    rcptto = destinationMail
+    # 构建alternative结构
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = Header('Welcome Matis'.decode('utf-8')).encode()
+    msg['From'] = '%s <%s>' % (Header(''.decode('utf-8')).encode(), username)
+    msg['To'] = rcptto
+    msg['Reply-to'] = replyto
+    msg['Message-id'] = email.utils.make_msgid()
+    msg['Date'] = email.utils.formatdate()
+    # 构建alternative的text/plain部分
+    textplain = MIMEText("Hi:\nwelcome to use Matis smart device, your verification code is " + code +
+                         "\ncode will be expired in 10 minutes.", _subtype='plain', _charset='UTF-8')
+    msg.attach(textplain)
+    # 构建alternative的text/html部分
+    texthtml = MIMEText("Hi:\nwelcome to use Matis smart device, your verification code is " + code +
+                         "\ncode will be expired in 10 minutes.", _subtype='html', _charset='UTF-8')
+    msg.attach(texthtml)
+    # 发送邮件
+    try:
+        client = smtplib.SMTP()
+        # python 2.7以上版本，若需要使用SSL，可以这样创建client
+        # client = smtplib.SMTP_SSL()
+        # SMTP普通端口为25或80
+        client.connect('smtpdm.aliyun.com', 80)
+        # 开启DEBUG模式
+        client.set_debuglevel(0)
+        client.login(username, password)
+        # 发件人和认证地址必须一致
+        # 备注：若想取到DATA命令返回值,可参考smtplib的sendmaili封装方法:
+        #      使用SMTP.mail/SMTP.rcpt/SMTP.data方法
+        client.sendmail(username, rcptto, msg.as_string())
+        client.quit()
+        print '邮件发送成功！'
+    except smtplib.SMTPConnectError, e:
+        print '邮件发送失败，连接失败:', e.smtp_code, e.smtp_error
+    except smtplib.SMTPAuthenticationError, e:
+        print '邮件发送失败，认证错误:', e.smtp_code, e.smtp_error
+    except smtplib.SMTPSenderRefused, e:
+        print '邮件发送失败，发件人被拒绝:', e.smtp_code, e.smtp_error
+    except smtplib.SMTPRecipientsRefused, e:
+        print '邮件发送失败，收件人被拒绝:', e.smtp_code, e.smtp_error
+    except smtplib.SMTPDataError, e:
+        print '邮件发送失败，数据接收拒绝:', e.smtp_code, e.smtp_error
+    except smtplib.SMTPException, e:
+        print '邮件发送失败, ', e.message
+    except Exception, e:
+        print '邮件发送异常, ', str(e)
+
 
